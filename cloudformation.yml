@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: プライベートEC2にSSM接続し、ALBで公開するCloudFormationテンプレート (循環参照修正版)
+
+Resources:
+  # ----------------------------
+  # VPC
+  # ----------------------------
+  StudyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: aws-study-vpc
+
+  # ----------------------------
+  # Public Subnets (ALB用)
+  # ----------------------------
+  PublicSubnet1a:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-northeast-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: aws-study-public-1a
+
+  PublicSubnet1c:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-northeast-1c
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: aws-study-public-1c
+
+  # ----------------------------
+  # Private Subnets (EC2用)
+  # ----------------------------
+  PrivateSubnet1a:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: ap-northeast-1a
+      Tags:
+        - Key: Name
+          Value: aws-study-private-1a
+
+  PrivateSubnet1c:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudyVPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: ap-northeast-1c
+      Tags:
+        - Key: Name
+          Value: aws-study-private-1c
+
+  # ----------------------------
+  # Internet Gateway
+  # ----------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: aws-study-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref StudyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ----------------------------
+  # Public Route Table
+  # ----------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StudyVPC
+      Tags:
+        - Key: Name
+          Value: aws-study-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1aRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1a
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet1cRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1c
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------
+  # Private Route Table
+  # ----------------------------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StudyVPC
+      Tags:
+        - Key: Name
+          Value: aws-study-private-rt
+
+  PrivateSubnet1aRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1a
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet1cRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1c
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ----------------------------
+  # S3 VPC Endpoint
+  # ----------------------------
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref StudyVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrivateRouteTable
+
+  # ----------------------------
+  # Security Group for ALB
+  # ----------------------------
+  StudyALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: aws-study-alb-sg
+      GroupDescription: Security group for ALB
+      VpcId: !Ref StudyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: aws-study-alb-sg
+
+  # ----------------------------
+  # Security Group for EC2
+  # ----------------------------
+  StudyEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: aws-study-ec2-sg
+      GroupDescription: Security group for EC2 (private, SSM)
+      VpcId: !Ref StudyVPC
+      # 【修正点】循環参照回避のため、ここではルールを書かず「空の箱」として定義します
+      Tags:
+        - Key: Name
+          Value: aws-study-ec2-sg
+
+  # 【追加】EC2用SGルール: ALBからの許可 (分離して定義)
+  StudyEC2SGRuleALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref StudyEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref StudyALBSecurityGroup
+
+  # 【追加】EC2用SGアウトバウンドルール: VPC内へのHTTPS許可（VPC Endpointへの接続用）
+  StudyEC2SGEgressHTTPS:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref StudyEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 10.0.0.0/16
+      Description: Allow HTTPS to VPC endpoints
+
+  # ----------------------------
+  # Security Group for VPC Endpoints
+  # ----------------------------
+  StudyVPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: aws-study-vpc-endpoint-sg
+      GroupDescription: Security group for VPC Endpoints (SSM)
+      VpcId: !Ref StudyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref StudyEC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: aws-study-vpc-endpoint-sg
+
+  # ----------------------------
+  # IAM Role for SSM
+  # ----------------------------
+  StudyEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  StudyEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref StudyEC2Role
+
+  # ----------------------------
+  # SSM VPC Endpoints
+  # ----------------------------
+  SSMSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref StudyVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1a
+        - !Ref PrivateSubnet1c
+      SecurityGroupIds:
+        - !Ref StudyVPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref StudyVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1a
+        - !Ref PrivateSubnet1c
+      SecurityGroupIds:
+        - !Ref StudyVPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref StudyVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1a
+        - !Ref PrivateSubnet1c
+      SecurityGroupIds:
+        - !Ref StudyVPCEndpointSecurityGroup
+
+  # ----------------------------
+  # EC2 Instance (Private)
+  # ----------------------------
+  StudyEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}"
+      SubnetId: !Ref PrivateSubnet1a
+      SecurityGroupIds:
+        - !Ref StudyEC2SecurityGroup
+      IamInstanceProfile: !Ref StudyEC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: aws-study-ec2
+
+  # ----------------------------
+  # ALB
+  # ----------------------------
+  StudyALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-study-alb
+      Subnets:
+        - !Ref PublicSubnet1a
+        - !Ref PublicSubnet1c
+      SecurityGroups:
+        - !Ref StudyALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  StudyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: aws-study-tg
+      VpcId: !Ref StudyVPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref StudyEC2
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200
+
+  StudyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref StudyTargetGroup
+      LoadBalancerArn: !Ref StudyALB
+      Port: 80
+      Protocol: HTTP
